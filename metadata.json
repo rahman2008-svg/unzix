@@ -1,0 +1,6 @@
+{
+  "name": "Unzix",
+  "description": "An advanced offline archive manager and file explorer. Compress, extract, and view ZIP and TAR files with modern Material 3 design, speed, and safety.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
