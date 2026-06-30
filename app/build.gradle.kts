@@ -1,4 +1,6 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.io.ByteArrayOutputStream
+import javax.inject.Inject
 
 plugins {
   alias(libs.plugins.android.application)
@@ -25,11 +27,30 @@ android {
 
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
-      storeFile = file(keystorePath)
-      storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
-      keyPassword = System.getenv("KEY_PASSWORD")
+      val envKeystorePath = System.getenv("KEYSTORE_PATH")
+      val envStorePassword = System.getenv("STORE_PASSWORD")
+      val envKeyPassword = System.getenv("KEY_PASSWORD")
+      val hasReleaseCreds = envKeystorePath != null &&
+        envStorePassword != null &&
+        envKeyPassword != null &&
+        file(envKeystorePath).exists()
+
+      if (hasReleaseCreds) {
+        storeFile = file(envKeystorePath!!)
+        storePassword = envStorePassword
+        keyAlias = "upload"
+        keyPassword = envKeyPassword
+      } else {
+        logger.warn(
+          "Release signing credentials not found (KEYSTORE_PATH/STORE_PASSWORD/KEY_PASSWORD). " +
+            "Falling back to the debug keystore for the release build type. " +
+            "Set those env vars before publishing a real release build."
+        )
+        storeFile = file("${rootDir}/debug.keystore")
+        storePassword = "android"
+        keyAlias = "androiddebugkey"
+        keyPassword = "android"
+      }
     }
     create("debugConfig") {
       storeFile = file("${rootDir}/debug.keystore")
@@ -72,6 +93,82 @@ googleServices {
   missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN
 }
 
+// Task type that generates a debug.keystore if one doesn't already exist.
+// Uses an injected ExecOperations instead of the deprecated/removed Project.exec
+// extension so this works under Gradle's configuration cache (Gradle 9.x+).
+abstract class GenerateDebugKeystoreTask : DefaultTask() {
+
+  @get:Inject
+  abstract val execOperations: ExecOperations
+
+  @get:OutputFile
+  abstract val keystoreFile: RegularFileProperty
+
+  @get:Internal
+  abstract val javaHome: Property<String>
+
+  @TaskAction
+  fun generate() {
+    val ksFile = keystoreFile.get().asFile
+    if (ksFile.exists()) {
+      logger.lifecycle("debug.keystore already exists at ${ksFile.absolutePath}, skipping generation.")
+      return
+    }
+
+    logger.lifecycle("debug.keystore not found at ${ksFile.absolutePath} — generating one now.")
+    val keytoolCandidate = File(javaHome.get(), "bin/keytool")
+    val keytoolPath = if (keytoolCandidate.exists()) keytoolCandidate.absolutePath else "keytool"
+
+    val stdout = ByteArrayOutputStream()
+    val stderr = ByteArrayOutputStream()
+    val result = execOperations.exec {
+      commandLine(
+        keytoolPath,
+        "-genkey", "-v",
+        "-keystore", ksFile.absolutePath,
+        "-storetype", "PKCS12",
+        "-alias", "androiddebugkey",
+        "-storepass", "android",
+        "-keypass", "android",
+        "-keyalg", "RSA",
+        "-keysize", "2048",
+        "-validity", "10000",
+        "-dname", "CN=Android Debug,O=Android,C=US"
+      )
+      standardOutput = stdout
+      errorOutput = stderr
+      isIgnoreExitValue = true
+    }
+
+    if (result.exitValue != 0 || !ksFile.exists()) {
+      throw GradleException(
+        "Failed to auto-generate debug.keystore via keytool.\n" +
+          "stdout:\n$stdout\n" +
+          "stderr:\n$stderr\n" +
+          "You can generate it manually with:\n" +
+          "keytool -genkey -v -keystore debug.keystore -storetype PKCS12 " +
+          "-alias androiddebugkey -storepass android -keypass android " +
+          "-keyalg RSA -keysize 2048 -validity 10000 -dname \"CN=Android Debug,O=Android,C=US\""
+      )
+    }
+    logger.lifecycle("debug.keystore generated successfully at ${ksFile.absolutePath}.")
+  }
+}
+
+// Auto-generate a debug.keystore at the PROJECT ROOT (matches the path used by
+// signingConfigs above: "${rootDir}/debug.keystore") if one doesn't already exist.
+// Prevents ":app:validateSigningDebug" from failing on fresh checkouts / CI machines
+// where debug.keystore was never committed (it's normally gitignored).
+val generateDebugKeystore = tasks.register<GenerateDebugKeystoreTask>("generateDebugKeystore") {
+  keystoreFile.set(File(rootDir, "debug.keystore"))
+  javaHome.set(System.getProperty("java.home"))
+}
+
+// Make sure the keystore exists before Gradle tries to validate any signing config
+// that depends on it (debug build type, and release when it falls back to debug signing).
+tasks.matching { it.name.startsWith("validateSigning") }.configureEach {
+  dependsOn(generateDebugKeystore)
+}
 
 // Some unused dependencies are commented out below instead of being removed.
 // This makes it easy to add them back in the future if needed.
